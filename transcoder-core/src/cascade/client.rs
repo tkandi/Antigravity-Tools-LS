@@ -8,7 +8,7 @@ use crate::proto::exa::codeium_common_pb::{Metadata, TextOrScopeItem};
 use crate::proto::exa::reactive_component_pb::{StreamReactiveUpdatesRequest, MessageDiff};
 use crate::mappers::CascadeDelta; // 👈 引入新的增量类型
 use tokio::time::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_stream::StreamExt;
 
 pub struct CascadeClient {
@@ -226,7 +226,9 @@ impl CascadeClient {
         tokio::spawn(async move {
             let mut last_text_sent_len = 0;
             let mut last_thinking_sent_len = 0;
-            let mut retry_count = 0;
+            let mut error_retry_count = 0;
+            let mut idle_poll_count = 0;
+            let mut last_progress_at = Instant::now();
 
             loop {
                 let mut req = Request::new(GetCascadeTrajectoryRequest {
@@ -237,6 +239,8 @@ impl CascadeClient {
 
                 match client_clone.get_cascade_trajectory(req).await {
                     Ok(resp) => {
+                        error_retry_count = 0;
+                        let mut made_progress = false;
                         let traj_resp = resp.into_inner();
                         if let Some(traj) = &traj_resp.trajectory {
                             // 查找最新的 PlannerResponse
@@ -254,28 +258,45 @@ impl CascadeClient {
                                     let delta = &pr.response[last_text_sent_len..];
                                     if tx.send(Ok(CascadeDelta::Text(delta.to_string()))).await.is_err() { break; }
                                     last_text_sent_len = pr.response.len();
+                                    made_progress = true;
                                 }
                                 // 处理思考链 Thinking (字段 3)
                                 if pr.thinking.len() > last_thinking_sent_len {
                                     let delta = &pr.thinking[last_thinking_sent_len..];
                                     if tx.send(Ok(CascadeDelta::Thinking(delta.to_string()))).await.is_err() { break; }
                                     last_thinking_sent_len = pr.thinking.len();
+                                    made_progress = true;
                                 }
                             }
 
+                            if made_progress {
+                                last_progress_at = Instant::now();
+                                idle_poll_count = 0;
+                            }
+
                             // 状态退出逻辑
-                            if traj_resp.status == CascadeRunStatus::Idle as i32 && retry_count > 10 {
+                            if traj_resp.status == CascadeRunStatus::Idle as i32 {
+                                idle_poll_count += 1;
+                            } else {
+                                idle_poll_count = 0;
+                            }
+
+                            if idle_poll_count > 10 {
                                 break;
                             }
                         }
-                        
-                        if retry_count > 120 { // 约 1 分钟超时
-                             break;
+
+                        // 只在长时间没有任何 Text/Thinking 增量时退出。Thinking 模型持续输出
+                        // reasoning_content 时会不断刷新 last_progress_at，不应被固定总时长切断。
+                        if last_progress_at.elapsed() > Duration::from_secs(300) {
+                            tracing::warn!("⚠️ [Cascade] 5 分钟无任何增量，结束轮询");
+                            break;
                         }
                     }
                     Err(s) => {
-                        if retry_count < 5 {
-                            sleep(Duration::from_secs(1 << retry_count)).await;
+                        if error_retry_count < 5 {
+                            sleep(Duration::from_secs(1 << error_retry_count)).await;
+                            error_retry_count += 1;
                         } else {
                             let _ = tx.send(Err(s)).await;
                             break;
@@ -283,7 +304,6 @@ impl CascadeClient {
                     }
                 }
 
-                retry_count += 1;
                 sleep(Duration::from_millis(500)).await;
             }
         });

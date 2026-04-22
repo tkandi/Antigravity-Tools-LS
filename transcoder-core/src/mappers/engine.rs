@@ -103,17 +103,18 @@ async fn run_transcode_loop_with_client<M: ProtocolMapper>(
     }
 
     let mut full_response_content = String::new();
+    let mut saw_any_delta = false;
 
     if let Some(res) = first_res {
-        process_one_delta::<M>(&tx, &model_name, is_lite, res, &mut vcot_state, &mut full_response_content, &mut tool_call_buffer, &mut in_tool_call, &mut tool_call_index).await?;
+        process_one_delta::<M>(&tx, &model_name, is_lite, res, &mut vcot_state, &mut full_response_content, &mut saw_any_delta, &mut tool_call_buffer, &mut in_tool_call, &mut tool_call_index).await?;
     }
 
     while let Some(res) = rx_cascade.recv().await {
-        process_one_delta::<M>(&tx, &model_name, is_lite, res, &mut vcot_state, &mut full_response_content, &mut tool_call_buffer, &mut in_tool_call, &mut tool_call_index).await?;
+        process_one_delta::<M>(&tx, &model_name, is_lite, res, &mut vcot_state, &mut full_response_content, &mut saw_any_delta, &mut tool_call_buffer, &mut in_tool_call, &mut tool_call_index).await?;
     }
 
-    // 🚀 核心兜底逻辑：如果流执行完毕但没有任何内容产出，通常意味着 LS 进程发生了静默报错
-    if full_response_content.is_empty() {
+    // 🚀 核心兜底逻辑：如果流执行完毕但没有任何 Text/Thinking 产出，通常意味着 LS 进程发生了静默报错
+    if !saw_any_delta {
          let mut err_msg = "内核返回内容为空，可能触发了 403 权限或网络异常。".to_string();
          if let Some(ref fetcher) = conn.error_fetcher {
              if let Some(raw_err) = fetcher.get_last_error() { err_msg = raw_err; }
@@ -147,6 +148,7 @@ async fn process_one_delta<M: ProtocolMapper>(
     res: Result<crate::mappers::CascadeDelta, tonic::Status>,
     state: &mut VCoTState,
     full_content: &mut String,
+    saw_any_delta: &mut bool,
     tc_buf: &mut String,
     in_tc: &mut bool,
     tc_idx: &mut u32,
@@ -155,10 +157,16 @@ async fn process_one_delta<M: ProtocolMapper>(
         Ok(delta) => {
             match delta {
                 crate::mappers::CascadeDelta::Thinking(t) => {
+                    if !t.is_empty() {
+                        *saw_any_delta = true;
+                    }
                     let chunks = M::map_delta(model_name, crate::mappers::CascadeDelta::Thinking(t), false, tc_buf, in_tc, tc_idx).await?;
                     for chunk in chunks { let _ = tx.send(chunk).await; }
                 }
                 crate::mappers::CascadeDelta::Text(t) => {
+                    if !t.is_empty() {
+                        *saw_any_delta = true;
+                    }
                     if !is_lite {
                         full_content.push_str(&t);
                         let chunks = M::map_delta(model_name, crate::mappers::CascadeDelta::Text(t), false, tc_buf, in_tc, tc_idx).await?;
