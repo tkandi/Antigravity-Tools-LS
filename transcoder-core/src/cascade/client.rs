@@ -21,6 +21,12 @@ pub struct CascadeClient {
     auth_token: String,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct PlannerStepCursor {
+    text_len: usize,
+    thinking_len: usize,
+}
+
 fn save_image_to_disk(image_data: &[u8], mime_type: &str) -> String {
     let mime = if mime_type.is_empty() { "image/png" } else { mime_type };
     let file_id = uuid::Uuid::new_v4();
@@ -224,8 +230,7 @@ impl CascadeClient {
 
         // 3. 轮询 Fallback 与 最终快照确认
         tokio::spawn(async move {
-            let mut last_text_sent_len = 0;
-            let mut last_thinking_sent_len = 0;
+            let mut planner_step_cursors: Vec<PlannerStepCursor> = Vec::new();
             let mut error_retry_count = 0;
             let mut idle_poll_count = 0;
             let mut last_progress_at = Instant::now();
@@ -243,28 +248,57 @@ impl CascadeClient {
                         let mut made_progress = false;
                         let traj_resp = resp.into_inner();
                         if let Some(traj) = &traj_resp.trajectory {
-                            // 查找最新的 PlannerResponse
-                            let planner_res = traj.steps.iter().rev()
-                                .filter(|s| s.r#type == CortexStepType::PlannerResponse as i32)
-                                .find_map(|s| {
-                                    if let Some(crate::proto::gemini_coder::step::Step::PlannerResponse(pr)) = &s.step {
-                                        Some(pr)
-                                    } else { None }
-                                });
+                            // 逐个处理所有 PlannerResponse step。一次对话中可能会出现多个独立的
+                            // thinking phase；如果只盯着“最新一个 step + 全局长度游标”，在 step
+                            // 切换后新的 thinking 通常会因为长度重置而被跳过，表现为流卡住。
+                            for (step_index, step) in traj.steps.iter().enumerate() {
+                                if step.r#type != CortexStepType::PlannerResponse as i32 {
+                                    continue;
+                                }
 
-                            if let Some(pr) = planner_res {
+                                let Some(crate::proto::gemini_coder::step::Step::PlannerResponse(pr)) = &step.step else {
+                                    continue;
+                                };
+
+                                if planner_step_cursors.len() <= step_index {
+                                    planner_step_cursors.resize(step_index + 1, PlannerStepCursor::default());
+                                }
+
+                                let cursor = &mut planner_step_cursors[step_index];
+
+                                // 某些独立 phase 会切到新的 PlannerResponse step；极端情况下同一 step
+                                // 也可能被上游重写，导致字符串长度回退。这里显式重置该 step 的游标。
+                                if pr.response.len() < cursor.text_len {
+                                    tracing::warn!(
+                                        "⚠️ [Cascade] PlannerResponse step {} response length regressed: {} -> {}",
+                                        step_index,
+                                        cursor.text_len,
+                                        pr.response.len()
+                                    );
+                                    cursor.text_len = 0;
+                                }
+                                if pr.thinking.len() < cursor.thinking_len {
+                                    tracing::warn!(
+                                        "⚠️ [Cascade] PlannerResponse step {} thinking length regressed: {} -> {}",
+                                        step_index,
+                                        cursor.thinking_len,
+                                        pr.thinking.len()
+                                    );
+                                    cursor.thinking_len = 0;
+                                }
+
                                 // 处理正文 Text
-                                if pr.response.len() > last_text_sent_len {
-                                    let delta = &pr.response[last_text_sent_len..];
+                                if pr.response.len() > cursor.text_len {
+                                    let delta = &pr.response[cursor.text_len..];
                                     if tx.send(Ok(CascadeDelta::Text(delta.to_string()))).await.is_err() { break; }
-                                    last_text_sent_len = pr.response.len();
+                                    cursor.text_len = pr.response.len();
                                     made_progress = true;
                                 }
                                 // 处理思考链 Thinking (字段 3)
-                                if pr.thinking.len() > last_thinking_sent_len {
-                                    let delta = &pr.thinking[last_thinking_sent_len..];
+                                if pr.thinking.len() > cursor.thinking_len {
+                                    let delta = &pr.thinking[cursor.thinking_len..];
                                     if tx.send(Ok(CascadeDelta::Thinking(delta.to_string()))).await.is_err() { break; }
-                                    last_thinking_sent_len = pr.thinking.len();
+                                    cursor.thinking_len = pr.thinking.len();
                                     made_progress = true;
                                 }
                             }
