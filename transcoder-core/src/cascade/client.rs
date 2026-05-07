@@ -234,6 +234,7 @@ impl CascadeClient {
             let mut error_retry_count = 0;
             let mut idle_poll_count = 0;
             let mut last_progress_at = Instant::now();
+            let mut pending_text_deltas: Vec<String> = Vec::new();
 
             loop {
                 let mut req = Request::new(GetCascadeTrajectoryRequest {
@@ -307,16 +308,22 @@ impl CascadeClient {
                             }
 
                             // 同一轮询快照可能包含多个 PlannerResponse step。先发完本轮所有
-                            // thinking，再发本轮所有 text，避免较早 step 的 content 插到较晚
+                            // thinking，再处理本轮 text，避免较早 step 的 content 插到较晚
                             // step 的 reasoning_content 之前。
+                            let saw_snapshot_thinking = !snapshot_thinking_deltas.is_empty();
                             for delta in snapshot_thinking_deltas {
                                 if tx.send(Ok(CascadeDelta::Thinking(delta))).await.is_err() {
                                     break;
                                 }
                             }
-                            for delta in snapshot_text_deltas {
-                                if tx.send(Ok(CascadeDelta::Text(delta))).await.is_err() {
-                                    break;
+                            pending_text_deltas.extend(snapshot_text_deltas);
+                            // 上游有时会在正文出现后的下一次轮询继续补 thinking
+                            // 尾巴；只在本轮没有新的 thinking 时释放已暂存正文。
+                            if !saw_snapshot_thinking {
+                                for delta in pending_text_deltas.drain(..) {
+                                    if tx.send(Ok(CascadeDelta::Text(delta))).await.is_err() {
+                                        break;
+                                    }
                                 }
                             }
 
