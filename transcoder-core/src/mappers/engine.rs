@@ -54,7 +54,14 @@ pub async fn handle_generic_stream<M: ProtocolMapper>(
     ).await?;
 
     // 发起流式请求
-    let mut rx_cascade = client.chat_stream(prompt.clone(), conn.resolved_model_id, images, media).await?;
+    let force_reasoning_before_text = model_name.to_lowercase().contains("thinking");
+    let mut rx_cascade = client.chat_stream(
+        prompt.clone(),
+        conn.resolved_model_id,
+        images,
+        media,
+        force_reasoning_before_text,
+    ).await?;
 
     // 🚀 关键改进：尝试读取第一帧。如果 LS 直接关闭流且 stderr 有 403，则截获
     let first_res = rx_cascade.recv().await;
