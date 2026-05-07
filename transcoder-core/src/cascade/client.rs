@@ -287,18 +287,19 @@ impl CascadeClient {
                                     cursor.thinking_len = 0;
                                 }
 
-                                // 处理正文 Text
-                                if pr.response.len() > cursor.text_len {
-                                    let delta = &pr.response[cursor.text_len..];
-                                    if tx.send(Ok(CascadeDelta::Text(delta.to_string()))).await.is_err() { break; }
-                                    cursor.text_len = pr.response.len();
-                                    made_progress = true;
-                                }
                                 // 处理思考链 Thinking (字段 3)
                                 if pr.thinking.len() > cursor.thinking_len {
                                     let delta = &pr.thinking[cursor.thinking_len..];
                                     if tx.send(Ok(CascadeDelta::Thinking(delta.to_string()))).await.is_err() { break; }
                                     cursor.thinking_len = pr.thinking.len();
+                                    made_progress = true;
+                                }
+                                // 处理正文 Text。若同一轮询快照中 thinking/response 都有新增，
+                                // 先发 thinking，避免 content 插入本轮 reasoning_content 之前。
+                                if pr.response.len() > cursor.text_len {
+                                    let delta = &pr.response[cursor.text_len..];
+                                    if tx.send(Ok(CascadeDelta::Text(delta.to_string()))).await.is_err() { break; }
+                                    cursor.text_len = pr.response.len();
                                     made_progress = true;
                                 }
                             }
