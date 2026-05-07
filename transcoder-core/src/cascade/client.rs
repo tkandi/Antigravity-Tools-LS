@@ -248,6 +248,9 @@ impl CascadeClient {
                         let mut made_progress = false;
                         let traj_resp = resp.into_inner();
                         if let Some(traj) = &traj_resp.trajectory {
+                            let mut snapshot_thinking_deltas = Vec::new();
+                            let mut snapshot_text_deltas = Vec::new();
+
                             // 逐个处理所有 PlannerResponse step。一次对话中可能会出现多个独立的
                             // thinking phase；如果只盯着“最新一个 step + 全局长度游标”，在 step
                             // 切换后新的 thinking 通常会因为长度重置而被跳过，表现为流卡住。
@@ -290,17 +293,30 @@ impl CascadeClient {
                                 // 处理思考链 Thinking (字段 3)
                                 if pr.thinking.len() > cursor.thinking_len {
                                     let delta = &pr.thinking[cursor.thinking_len..];
-                                    if tx.send(Ok(CascadeDelta::Thinking(delta.to_string()))).await.is_err() { break; }
+                                    snapshot_thinking_deltas.push(delta.to_string());
                                     cursor.thinking_len = pr.thinking.len();
                                     made_progress = true;
                                 }
-                                // 处理正文 Text。若同一轮询快照中 thinking/response 都有新增，
-                                // 先发 thinking，避免 content 插入本轮 reasoning_content 之前。
+                                // 处理正文 Text
                                 if pr.response.len() > cursor.text_len {
                                     let delta = &pr.response[cursor.text_len..];
-                                    if tx.send(Ok(CascadeDelta::Text(delta.to_string()))).await.is_err() { break; }
+                                    snapshot_text_deltas.push(delta.to_string());
                                     cursor.text_len = pr.response.len();
                                     made_progress = true;
+                                }
+                            }
+
+                            // 同一轮询快照可能包含多个 PlannerResponse step。先发完本轮所有
+                            // thinking，再发本轮所有 text，避免较早 step 的 content 插到较晚
+                            // step 的 reasoning_content 之前。
+                            for delta in snapshot_thinking_deltas {
+                                if tx.send(Ok(CascadeDelta::Thinking(delta))).await.is_err() {
+                                    break;
+                                }
+                            }
+                            for delta in snapshot_text_deltas {
+                                if tx.send(Ok(CascadeDelta::Text(delta))).await.is_err() {
+                                    break;
                                 }
                             }
 
