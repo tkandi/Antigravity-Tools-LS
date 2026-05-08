@@ -27,6 +27,151 @@ struct PlannerStepCursor {
     thinking_len: usize,
 }
 
+fn shorten_for_progress(value: &str, max_chars: usize) -> String {
+    let trimmed = value.trim();
+    let mut chars = trimmed.chars();
+    let shortened: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{}...", shortened)
+    } else {
+        shortened.to_string()
+    }
+}
+
+fn step_status_label(status: i32) -> &'static str {
+    if status == CortexStepStatus::Generating as i32 {
+        "生成中"
+    } else if status == CortexStepStatus::Running as i32 {
+        "运行中"
+    } else if status == CortexStepStatus::Waiting as i32 {
+        "等待中"
+    } else if status == CortexStepStatus::Done as i32 {
+        "已完成"
+    } else if status == CortexStepStatus::Error as i32 {
+        "出错"
+    } else if status == CortexStepStatus::Queued as i32 {
+        "排队中"
+    } else if status == CortexStepStatus::Pending as i32 {
+        "待执行"
+    } else {
+        "处理中"
+    }
+}
+
+fn progress_for_step(
+    step_index: usize,
+    step: &crate::proto::gemini_coder::Step,
+) -> Option<(String, String)> {
+    let status = step_status_label(step.status);
+    let kind = step.step.as_ref()?;
+
+    match kind {
+        crate::proto::gemini_coder::step::Step::SearchWeb(search) => {
+            let query = shorten_for_progress(&search.query, 80);
+            let query_label = if query.is_empty() {
+                "搜索网络".to_string()
+            } else {
+                format!("搜索网络：{}", query)
+            };
+            let count = search.web_documents.len();
+            let signature = format!("{}:{}:{}:{}", step_index, step.status, search.query, count);
+            let message = if count > 0 {
+                format!("{}（{}，已返回 {} 条结果）", query_label, status, count)
+            } else {
+                format!("{}（{}）", query_label, status)
+            };
+            Some((signature, message))
+        }
+        crate::proto::gemini_coder::step::Step::ReadUrlContent(read) => {
+            let url = if read.resolved_url.is_empty() {
+                &read.url
+            } else {
+                &read.resolved_url
+            };
+            if url.is_empty() {
+                return None;
+            }
+            let short_url = shorten_for_progress(url, 100);
+            Some((
+                format!(
+                    "{}:{}:{}:{}",
+                    step_index, step.status, read.url, read.resolved_url
+                ),
+                format!("读取网页内容：{}（{}）", short_url, status),
+            ))
+        }
+        crate::proto::gemini_coder::step::Step::ViewContentChunk(chunk) => {
+            if chunk.document_id.is_empty() {
+                return None;
+            }
+            let id = shorten_for_progress(&chunk.document_id, 80);
+            Some((
+                format!("{}:{}:{}", step_index, step.status, chunk.document_id),
+                format!("查看检索内容片段：{}（{}）", id, status),
+            ))
+        }
+        crate::proto::gemini_coder::step::Step::KnowledgeGeneration(_) => Some((
+            format!("{}:{}", step_index, step.status),
+            format!("整理检索材料（{}）", status),
+        )),
+        crate::proto::gemini_coder::step::Step::WriteToFile(write) => {
+            if write.target_file_uri.is_empty() {
+                return None;
+            }
+            let target = shorten_for_progress(&write.target_file_uri, 100);
+            Some((
+                format!("{}:{}:{}", step_index, step.status, write.target_file_uri),
+                format!("写入文件：{}（{}）", target, status),
+            ))
+        }
+        crate::proto::gemini_coder::step::Step::McpTool(tool) => {
+            let tool_name = tool
+                .tool_call
+                .as_ref()
+                .map(|call| call.name.as_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or("MCP 工具");
+            let progress = if tool.progress_message.is_empty() {
+                tool_name.to_string()
+            } else {
+                format!("{}：{}", tool_name, shorten_for_progress(&tool.progress_message, 80))
+            };
+            Some((
+                format!(
+                    "{}:{}:{}:{}:{}",
+                    step_index, step.status, tool.server_name, tool_name, tool.progress_message
+                ),
+                format!("执行 {}（{}）", progress, status),
+            ))
+        }
+        crate::proto::gemini_coder::step::Step::RunCommand(command) => {
+            let cmd = if command.command_line.is_empty() {
+                &command.command
+            } else {
+                &command.command_line
+            };
+            if cmd.is_empty() {
+                return None;
+            }
+            Some((
+                format!("{}:{}:{}:{:?}", step_index, step.status, cmd, command.exit_code),
+                format!("执行命令：{}（{}）", shorten_for_progress(cmd, 100), status),
+            ))
+        }
+        crate::proto::gemini_coder::step::Step::NotifyUser(notification) => {
+            if notification.notification_content.is_empty() {
+                return None;
+            }
+            let message = shorten_for_progress(&notification.notification_content, 100);
+            Some((
+                format!("{}:{}:{}", step_index, step.status, notification.notification_content),
+                format!("通知：{}（{}）", message, status),
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn save_image_to_disk(image_data: &[u8], mime_type: &str) -> String {
     let mime = if mime_type.is_empty() { "image/png" } else { mime_type };
     let file_id = uuid::Uuid::new_v4();
@@ -174,6 +319,7 @@ impl CascadeClient {
         model_id: i32, 
         images: Vec<crate::proto::exa::codeium_common_pb::ImageData>,
         media: Vec<crate::proto::exa::codeium_common_pb::Media>,
+        force_reasoning_before_text: bool,
     ) -> Result<tokio::sync::mpsc::Receiver<Result<CascadeDelta, tonic::Status>>, anyhow::Error> {
         let (tx, rx) = tokio::sync::mpsc::channel(128);
         let model_enum = model_id;
@@ -234,6 +380,10 @@ impl CascadeClient {
             let mut error_retry_count = 0;
             let mut idle_poll_count = 0;
             let mut last_progress_at = Instant::now();
+            let mut last_visible_progress_at = Instant::now();
+            let mut pending_text_deltas: Vec<String> = Vec::new();
+            let mut progress_step_signatures: Vec<String> = Vec::new();
+            let mut ended_with_error = false;
 
             loop {
                 let mut req = Request::new(GetCascadeTrajectoryRequest {
@@ -248,10 +398,27 @@ impl CascadeClient {
                         let mut made_progress = false;
                         let traj_resp = resp.into_inner();
                         if let Some(traj) = &traj_resp.trajectory {
+                            let mut snapshot_thinking_deltas = Vec::new();
+                            let mut snapshot_progress_deltas = Vec::new();
+                            let mut snapshot_text_deltas = Vec::new();
+
                             // 逐个处理所有 PlannerResponse step。一次对话中可能会出现多个独立的
                             // thinking phase；如果只盯着“最新一个 step + 全局长度游标”，在 step
                             // 切换后新的 thinking 通常会因为长度重置而被跳过，表现为流卡住。
                             for (step_index, step) in traj.steps.iter().enumerate() {
+                                if force_reasoning_before_text {
+                                    if let Some((signature, message)) = progress_for_step(step_index, step) {
+                                        if progress_step_signatures.len() <= step_index {
+                                            progress_step_signatures.resize(step_index + 1, String::new());
+                                        }
+                                        if progress_step_signatures[step_index] != signature {
+                                            progress_step_signatures[step_index] = signature;
+                                            snapshot_progress_deltas.push(format!("\n[进度] {}\n", message));
+                                            made_progress = true;
+                                        }
+                                    }
+                                }
+
                                 if step.r#type != CortexStepType::PlannerResponse as i32 {
                                     continue;
                                 }
@@ -290,18 +457,60 @@ impl CascadeClient {
                                 // 处理思考链 Thinking (字段 3)
                                 if pr.thinking.len() > cursor.thinking_len {
                                     let delta = &pr.thinking[cursor.thinking_len..];
-                                    if tx.send(Ok(CascadeDelta::Thinking(delta.to_string()))).await.is_err() { break; }
+                                    snapshot_thinking_deltas.push(delta.to_string());
                                     cursor.thinking_len = pr.thinking.len();
                                     made_progress = true;
                                 }
-                                // 处理正文 Text。若同一轮询快照中 thinking/response 都有新增，
-                                // 先发 thinking，避免 content 插入本轮 reasoning_content 之前。
+                                // 处理正文 Text
                                 if pr.response.len() > cursor.text_len {
                                     let delta = &pr.response[cursor.text_len..];
-                                    if tx.send(Ok(CascadeDelta::Text(delta.to_string()))).await.is_err() { break; }
+                                    snapshot_text_deltas.push(delta.to_string());
                                     cursor.text_len = pr.response.len();
                                     made_progress = true;
                                 }
+                            }
+
+                            if force_reasoning_before_text
+                                && snapshot_thinking_deltas.is_empty()
+                                && snapshot_progress_deltas.is_empty()
+                                && snapshot_text_deltas.is_empty()
+                                && traj_resp.status != CascadeRunStatus::Idle as i32
+                                && last_visible_progress_at.elapsed() > Duration::from_secs(20)
+                            {
+                                snapshot_progress_deltas.push(
+                                    "\n[进度] Antigravity 内核仍在执行，等待新的模型或工具输出。\n".to_string(),
+                                );
+                            }
+
+                            let visible_now = !snapshot_thinking_deltas.is_empty()
+                                || !snapshot_progress_deltas.is_empty()
+                                || (!force_reasoning_before_text && !snapshot_text_deltas.is_empty());
+
+                            // 同一轮询快照可能包含多个 PlannerResponse step。始终先发完本轮所有
+                            // thinking/progress；thinking 模型的 text 额外延迟到轮询结束后再释放。
+                            for delta in snapshot_thinking_deltas {
+                                if tx.send(Ok(CascadeDelta::Thinking(delta))).await.is_err() {
+                                    break;
+                                }
+                            }
+                            for delta in snapshot_progress_deltas {
+                                if tx.send(Ok(CascadeDelta::Thinking(delta))).await.is_err() {
+                                    break;
+                                }
+                            }
+                            if force_reasoning_before_text {
+                                pending_text_deltas.extend(snapshot_text_deltas);
+                            } else {
+                                pending_text_deltas.extend(snapshot_text_deltas);
+                                for delta in pending_text_deltas.drain(..) {
+                                    if tx.send(Ok(CascadeDelta::Text(delta))).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if visible_now {
+                                last_visible_progress_at = Instant::now();
                             }
 
                             if made_progress {
@@ -334,12 +543,21 @@ impl CascadeClient {
                             error_retry_count += 1;
                         } else {
                             let _ = tx.send(Err(s)).await;
+                            ended_with_error = true;
                             break;
                         }
                     }
                 }
 
                 sleep(Duration::from_millis(500)).await;
+            }
+
+            if !ended_with_error {
+                for delta in pending_text_deltas.drain(..) {
+                    if tx.send(Ok(CascadeDelta::Text(delta))).await.is_err() {
+                        break;
+                    }
+                }
             }
         });
 
