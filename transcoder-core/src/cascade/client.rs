@@ -381,9 +381,7 @@ impl CascadeClient {
             let mut idle_poll_count = 0;
             let mut last_progress_at = Instant::now();
             let mut last_visible_progress_at = Instant::now();
-            let mut pending_text_deltas: Vec<String> = Vec::new();
             let mut progress_step_signatures: Vec<String> = Vec::new();
-            let mut ended_with_error = false;
 
             loop {
                 let mut req = Request::new(GetCascadeTrajectoryRequest {
@@ -482,12 +480,13 @@ impl CascadeClient {
                                 );
                             }
 
+                            let had_text_delta = !snapshot_text_deltas.is_empty();
                             let visible_now = !snapshot_thinking_deltas.is_empty()
                                 || !snapshot_progress_deltas.is_empty()
-                                || (!force_reasoning_before_text && !snapshot_text_deltas.is_empty());
+                                || had_text_delta;
 
                             // 同一轮询快照可能包含多个 PlannerResponse step。始终先发完本轮所有
-                            // thinking/progress；thinking 模型的 text 额外延迟到轮询结束后再释放。
+                            // thinking/progress，再发正文；避免 content 抢在同一快照的 reasoning 前面。
                             for delta in snapshot_thinking_deltas {
                                 if tx.send(Ok(CascadeDelta::Thinking(delta))).await.is_err() {
                                     break;
@@ -498,14 +497,9 @@ impl CascadeClient {
                                     break;
                                 }
                             }
-                            if force_reasoning_before_text {
-                                pending_text_deltas.extend(snapshot_text_deltas);
-                            } else {
-                                pending_text_deltas.extend(snapshot_text_deltas);
-                                for delta in pending_text_deltas.drain(..) {
-                                    if tx.send(Ok(CascadeDelta::Text(delta))).await.is_err() {
-                                        break;
-                                    }
+                            for delta in snapshot_text_deltas {
+                                if tx.send(Ok(CascadeDelta::Text(delta))).await.is_err() {
+                                    break;
                                 }
                             }
 
@@ -543,21 +537,12 @@ impl CascadeClient {
                             error_retry_count += 1;
                         } else {
                             let _ = tx.send(Err(s)).await;
-                            ended_with_error = true;
                             break;
                         }
                     }
                 }
 
                 sleep(Duration::from_millis(500)).await;
-            }
-
-            if !ended_with_error {
-                for delta in pending_text_deltas.drain(..) {
-                    if tx.send(Ok(CascadeDelta::Text(delta))).await.is_err() {
-                        break;
-                    }
-                }
             }
         });
 
